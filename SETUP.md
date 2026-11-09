@@ -1,10 +1,16 @@
+# SETUP — NEW INSTALL (Beta 1)
+
+**One SQL file only: `schema.sql`.** Run it once in the Supabase SQL Editor on a new, empty project. It is the complete database (tables, functions, price history, company deposits / receipts, photo bucket, owner login PIN 12345). No migration files are needed. Then set `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` (service_role) in Vercel, deploy, log in with 12345 and choose your own PIN. (Old upgrade notes further below are for old databases only.)
+
+---
+
 # AXIION DMS — Multi-Business Edition · Deployment
 
 One owner, one PIN, **many businesses**. After the PIN the app shows your businesses; tapping one opens the full app for
 that business. Every business has its own products, stock, DSR/SO, shops, dues, expenses, reports, settings and numbering,
 and its own **month cycle** (the day the month starts, 1–28 — set by you when you create the business, changeable later).
 
-Stack: **Vercel** (serverless API, 10 functions — under the 12 limit) + **Supabase** (Postgres) + **GitHub**.
+Stack: **Vercel** (serverless API, 11 functions — under the 12 limit) + **Supabase** (Postgres) + **GitHub**.
 
 ## 1A. Brand-new Supabase project
 1. supabase.com → New project.
@@ -19,6 +25,18 @@ Stack: **Vercel** (serverless API, 10 functions — under the 12 limit) + **Supa
    business name, month cycle 26 → 25). Numbering (DSR-3, SHOP-0042, SL-000117 …) continues exactly where it was.
    Rename it / change its cycle later in the app. Run it **before** deploying the new code. It stops safely if run twice.
 3. Do **not** run `schema.sql` on a database that has data.
+
+## 1C. Upgrading from v9 → v10 (company receivable, offers, daily deposits)
+Run **`migrate-v10-offers-deposits.sql`** once in the Supabase SQL Editor (safe to re-run), then deploy the new code.
+It adds `company_receipts`, `company_deposits` and one-entry-per-day unique indexes (give / return / day-end).
+If old duplicate rows exist the index step is skipped with a NOTICE — delete the duplicates and run the file again.
+Until it is run the app still works (profit falls back to the old formula) and shows a warning.
+
+## 1D. Speed (v14.1)
+- **Run `add-speed-indexes.sql` once** in the Supabase SQL Editor if your database already exists (a brand-new install gets it from `schema.sql`). Safe to repeat; it only adds indexes.
+- **Vercel → Project → Settings → Functions → Function Region**: choose the region closest to your Supabase project (Supabase → Project Settings → General shows it; e.g. Singapore ↔ `sin1`). The API makes several database calls per screen; if the two are on different continents every call adds 200–300 ms. Redeploy after changing it.
+- Free Supabase projects pause after 1 week without use; the first request after a pause is slow — open the app once to wake it.
+- Long lists show 40 rows with **⬇ আরও দেখুন**; the server returns the full data beyond Supabase's 1000-row cap.
 
 ## 2. GitHub → Vercel
 1. Push this folder to a GitHub repository.

@@ -2,9 +2,10 @@
 //   GET  ?type=cats|expenses|contacts|settings
 //   POST {type:'cat'|'expense'|'contact'|'settings'|'reset', ...}
 //   DELETE ?type=cat|expense|contact&id=
-const { supabase, cors, str, safeErr, num, today, fetchAll, mapExpCat, mapExpRecord, auditLog, idemRun } = require('./_lib/db');
+const { supabase, cors, str, safeErr, num, today, fetchAll, fetchUpTo, mapExpCat, mapExpRecord, auditLog, idemRun } = require('./_lib/db');
 const { requireAuth, needPin, withBiz } = require('./_lib/auth');
 const { r2 } = require('./_lib/money');
+const { getOfferStart, setOfferStart } = require('./_lib/offer');
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DEFAULT_CATS = ['গাড়ি ভাড়া', 'বেতন', 'অফিস খরচ', 'বিদ্যুৎ বিল', 'খাবার', 'অন্যান্য'];
 
@@ -14,7 +15,8 @@ const RESET = {
   transactions: { label: 'লেনদেন (দেওয়া, ফেরত, ড্যামেজ, কেনা, বিক্রয়) — স্টক ০ হবে', tables: ['transactions'] },
   slips:        { label: 'দিনশেষ হিসাব ও DSR / SO-র বাকি জমা',                              tables: ['dayend_slips', 'sr_payments'] },
   dues:         { label: 'দোকানের বাকি ও আদায়',                                   tables: ['due_collections', 'due_calendar'] },
-  claims:       { label: 'ড্যামেজ দাবি ও বোনাস রেকর্ড',                            tables: ['dmg_claims', 'bonus'] },
+  claims:       { label: 'ড্যামেজ দাবি, বোনাস রেকর্ড ও কোম্পানি থেকে পাওয়া টাকার রেকর্ড', tables: ['dmg_claims', 'bonus', 'company_receipts'] },
+  deposits:     { label: 'কোম্পানিতে দৈনিক জমার রেকর্ড',                          tables: ['company_deposits'] },
   expenses:     { label: 'খরচের রেকর্ড',                                           tables: ['exp_records'] }
 };
 const settingsOut = (r) => ({ shopName: r.shop_name || '', shopAddress: r.shop_address || '', shopPhone: r.shop_phone || '', distributorName: r.distributor_name || '',
@@ -30,7 +32,8 @@ module.exports = withBiz(async (req, res) => {
       const type = q.type || 'settings';
       if (type === 'settings') {
         const { data } = await supabase.from('app_settings').select('*').eq('id', 1).maybeSingle();
-        return res.json({ ok: true, settings: settingsOut(data || {}), resetOptions: Object.keys(RESET).map(k => ({ key: k, label: RESET[k].label })) });
+        const so = settingsOut(data || {}); so.offerStartDate = await getOfferStart();   // v12 — "অফার হিসাব শুরুর তারিখ" ('' = not switched on yet)
+        return res.json({ ok: true, settings: so, resetOptions: Object.keys(RESET).map(k => ({ key: k, label: RESET[k].label })) });
       }
       if (type === 'cats') {
         let { data } = await supabase.from('exp_cats').select('*').order('created_at');
@@ -42,9 +45,11 @@ module.exports = withBiz(async (req, res) => {
       }
       if (type === 'expenses') {
         const from = DATE_RE.test(q.from || '') ? q.from : null, to = DATE_RE.test(q.to || '') ? q.to : null;
-        let qq = supabase.from('exp_records').select('*').order('date', { ascending: false }).order('created_at', { ascending: false }).limit(2000);
-        if (from) qq = qq.gte('date', from); if (to) qq = qq.lte('date', to);
-        const { data, error } = await qq; if (error) throw error;
+        const data = await fetchUpTo(() => {
+          let qq = supabase.from('exp_records').select('*').order('date', { ascending: false }).order('created_at', { ascending: false }).order('id', { ascending: false });
+          if (from) qq = qq.gte('date', from); if (to) qq = qq.lte('date', to);
+          return qq;
+        }, 3000);
         return res.json({ ok: true, expenses: (data || []).map(mapExpRecord) });
       }
       if (type === 'contacts') {
@@ -75,6 +80,13 @@ module.exports = withBiz(async (req, res) => {
         const { data, error } = d.id ? await supabase.from('important_contacts').update(row).eq('id', String(d.id)).select().single() : await supabase.from('important_contacts').insert(row).select().single();
         if (error) throw error;
         return res.json({ ok: true, id: String(data.id) });
+      }
+      if (d.type === 'offer-start') {   // v12: switch the automatic offer deduction on ("আজ থেকে চালু করুন") or pick / clear the start date
+        const date = d.today === true ? today() : String(d.date || '');
+        if (date && !DATE_RE.test(date)) return res.json({ ok: false, error: 'তারিখ ঠিক নয়' });
+        const v = await setOfferStart(date);
+        await auditLog({ id: 'owner', role: 'owner' }, 'update', 'offer_start', '', null, { offerStartDate: v });
+        return res.json({ ok: true, offerStartDate: v });
       }
       if (d.type === 'settings') {
         const row = { id: 1, updated_at: new Date().toISOString(), set_by: 'owner' };

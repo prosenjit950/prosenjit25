@@ -1,7 +1,7 @@
 -- ═══════════════════════════════════════════════════════════════════
 -- AXIION DMS — MULTI-BUSINESS EDITION  ·  schema.sql
 --
---   ONE file = the complete database. Run it ONCE in the Supabase SQL
+--   ONE file = the complete database (all migrations v6 / v7 / v10 / v11 are already merged in). Run it ONCE in the Supabase SQL
 --   editor on a brand-new, empty project. It creates:
 --     tables · indexes · functions · triggers · security policies ·
 --     the public "thumbs" photo bucket (no products — you add your own) ·
@@ -41,7 +41,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 DROP TABLE IF EXISTS biz_counters, businesses, dayend_slips, due_collections, due_calendar, shops, exp_records, exp_cats,
   sr_payments, bonus, dmg_claims, transactions, srs, sr_display_seq, products, user_passwords,
-  app_settings, important_contacts, audit_log, idempotency_keys CASCADE;
+  app_settings, important_contacts, audit_log, idempotency_keys, company_receipts, company_deposits CASCADE;
 DROP SEQUENCE IF EXISTS shop_no_seq;
 DROP SEQUENCE IF EXISTS slip_no_seq;
 
@@ -382,6 +382,48 @@ CREATE INDEX idx_idem_created ON idempotency_keys(created_at);
 
 
 
+-- ───────────────────────── COMPANY RECEIPTS (v10) ─────────────────────────
+-- Bonus / free-offer money and damage claims are only a "receivable" until the company really pays.
+-- When the owner taps "পেয়েছি" a row is written here; ONLY then does the amount move into the profit.
+--   kind   'bonus' | 'damage'          period  the month-cycle label 'YYYY-MM' the money was earned in
+CREATE TABLE company_receipts (
+  id            UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id   UUID          NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  kind          TEXT          NOT NULL CHECK (kind IN ('bonus','damage')),
+  period        TEXT          NOT NULL,
+  from_date     DATE          NOT NULL,
+  to_date       DATE          NOT NULL,
+  amount        NUMERIC(14,2) NOT NULL CHECK (amount > 0),
+  received_date DATE          NOT NULL,
+  note          TEXT          DEFAULT '',
+  created_at    TIMESTAMPTZ   DEFAULT NOW()
+);
+CREATE INDEX idx_rcpt_biz_date   ON company_receipts(business_id, received_date);
+CREATE INDEX idx_rcpt_biz_period ON company_receipts(business_id, kind, period);
+
+-- ───────────────────────── DAILY DEPOSIT TO THE COMPANY (v10) ─────────────────────────
+-- ONE row per business per day. Amount split by method; a day with nothing deposited is saved as 0.
+CREATE TABLE company_deposits (
+  id         UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id UUID         NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  date       DATE          NOT NULL,
+  online_amt NUMERIC(14,2) NOT NULL DEFAULT 0,      -- bKash / Nagad / Rocket / online
+  bank_amt   NUMERIC(14,2) NOT NULL DEFAULT 0,      -- bank transfer / deposit
+  cash_amt   NUMERIC(14,2) NOT NULL DEFAULT 0,      -- cash handed over
+  note       TEXT          DEFAULT '',
+  created_at TIMESTAMPTZ   DEFAULT NOW(),
+  updated_at TIMESTAMPTZ   DEFAULT NOW()
+);
+CREATE UNIQUE INDEX idx_dep_biz_date ON company_deposits(business_id, date);
+
+-- ───────────────────────── ONE ENTRY PER DAY (v10) ─────────────────────────
+-- A DSR / SO gets ONE load and hands back ONE return and ONE day-end slip per day. These indexes make a
+-- double tap / retry physically impossible to write twice (the app checks first, the database has the last word).
+CREATE UNIQUE INDEX idx_tx_one_give_per_day   ON transactions(business_id, sr_id, date, product_id) WHERE type = 'give';
+CREATE UNIQUE INDEX idx_tx_one_return_per_day ON transactions(business_id, sr_id, date, product_id) WHERE type = 'return';
+CREATE UNIQUE INDEX idx_slips_one_per_day     ON dayend_slips(business_id, dsr_id, date);
+
+
 -- per-business lookups (every query filters on business_id)
 CREATE INDEX idx_products_biz     ON products(business_id, sort_order);
 CREATE INDEX idx_srs_biz          ON srs(business_id, role);
@@ -399,6 +441,11 @@ CREATE INDEX idx_due_biz_shop     ON due_calendar(business_id, shop_id);
 CREATE INDEX idx_due_biz_date     ON due_calendar(business_id, entry_date);
 CREATE INDEX idx_duecol_biz_date  ON due_collections(business_id, date);
 CREATE INDEX idx_contacts_biz     ON important_contacts(business_id);
+-- SPEED: history lists read newest-first; the home screen counts "old lines not yet frozen" (partial index = empty once frozen → instant)
+CREATE INDEX IF NOT EXISTS idx_tx_biz_created  ON transactions(business_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tx_biz_legacy   ON transactions(business_id) WHERE rule_case_size IS NULL;
+CREATE INDEX IF NOT EXISTS idx_slips_biz_created ON dayend_slips(business_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pay_biz_created   ON sr_payments(business_id, created_at DESC);
 CREATE INDEX idx_audit_biz        ON audit_log(business_id, at DESC);
 
 -- ═══════════════════════════════════════════════════════════════════
@@ -756,7 +803,7 @@ DECLARE t TEXT;
 BEGIN
   FOREACH t IN ARRAY ARRAY['businesses','biz_counters','products','srs','transactions','dmg_claims','bonus','sr_payments','dayend_slips',
                            'exp_cats','exp_records','shops','due_calendar','due_collections','user_passwords','app_settings',
-                           'important_contacts','audit_log','idempotency_keys']
+                           'important_contacts','audit_log','idempotency_keys','company_receipts','company_deposits']
   LOOP
     EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
     EXECUTE format('CREATE POLICY %I ON %I FOR ALL TO service_role USING (true) WITH CHECK (true)', 'srv_' || t, t);
@@ -764,6 +811,27 @@ BEGIN
   END LOOP;
 END
 $$;
+
+-- ═══════════════ PRICE HISTORY + FREEZE MARKERS (merged from v11) ═══════════════
+CREATE TABLE IF NOT EXISTS product_price_history (
+  id           UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
+  business_id  UUID          NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+  product_id   TEXT          NOT NULL,
+  product_name TEXT          DEFAULT '',
+  field        TEXT          NOT NULL,
+  old_value    NUMERIC(14,4),
+  new_value    NUMERIC(14,4),
+  changed_at   TIMESTAMPTZ   DEFAULT NOW(),
+  changed_by   TEXT          DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_pph_biz_prod ON product_price_history(business_id, product_id, changed_at);
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS legacy    BOOLEAN;
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS frozen_at TIMESTAMPTZ;
+ALTER TABLE product_price_history ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS srv_product_price_history ON product_price_history;
+DROP POLICY IF EXISTS anon_deny_product_price_history ON product_price_history;
+CREATE POLICY srv_product_price_history ON product_price_history FOR ALL TO service_role USING (true) WITH CHECK (true);
+CREATE POLICY anon_deny_product_price_history ON product_price_history FOR ALL TO anon USING (false);
 
 -- ═══════════════ PHOTO BUCKET (public, name must be "thumbs") ═══════════════
 DO $$
